@@ -120,3 +120,9 @@ USE_TZ = True
 
 STATIC_URL = "static/"
 CORS_ALLOW_ALL_ORIGINS = True  # Para facilitar a comunicação com o dashboard
+
+# Confiança de origem para o sistema de segurança CSRF do Django 5/6
+CSRF_TRUSTED_ORIGINS = [
+    "https://eewalkirvergani-production.up.railway.app",
+    "https://*.railway.app",
+]

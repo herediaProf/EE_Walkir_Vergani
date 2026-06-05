@@ -2,38 +2,95 @@ import csv
 import glob
 import os
 import re
+from django.db.models import Count, Avg, F
+from django.db.models.functions import Cast
+from django.db import models
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
+
 from .models import ComponentGradeDetail, Student, Subject
 from .serializers import (
     StudentDashboardSerializer,
     ComponentGradeDetailSerializer,
-)  # <-- Certifique-se de ter esse serializer se o Vue for ler direto
+)
 
 
-class StudentViewSet(
-    viewsets.ModelViewSet
-):  # 🔓 Mudado de ReadOnlyModelViewSet para ModelViewSet
+class StudentViewSet(viewsets.ModelViewSet):
     """
-    Endpoint completo (CRUD) para visualizar, editar, atualizar e deletar alunos.
+    Endpoint completo (CRUD) para gerenciar alunos e gerar inteligência analítica para o Dashboard.
     """
 
-    queryset = Student.objects.all().order_by("name")
+    # 🏎️ Otimização N+1: Traz tudo em 2 queries com JOIN na memória
+    queryset = (
+        Student.objects.all()
+        .prefetch_related("component_grades__subject")
+        .order_by("name")
+    )
     serializer_class = StudentDashboardSerializer
 
     @action(detail=False, methods=["get"])
     def resumo_conselho(self, request):
-        """Gera uma métrica rápida para os cards superiores do Dashboard com base na IA e Status"""
-        total = self.get_queryset().count()
-        em_risco = self.get_queryset().filter(status__icontains="recuperação").count()
-        retidos_faltas = self.get_queryset().filter(status__icontains="retido").count()
+        """Gera métricas rápidas para os cartões superiores do painel usando agregação nativa."""
+        # Agregação unificada para evitar 3 COUNTs separados no banco
+        metricas = Student.objects.aggregate(
+            total=Count("id"),
+            em_risco=Count(
+                "id",
+                filter=models.Q(status__icontains="recuperação")
+                | models.Q(ia_risk_level__in=["CRÍTICO", "ALTO"]),
+            ),
+            retidos=Count("id", filter=models.Q(status__icontains="retido")),
+        )
+        return Response(
+            {
+                "total_alunos": metricas["total"],
+                "alunos_em_risco": metricas["em_risco"],
+                "alunos_retidos_faltas": metricas["retidos"],
+            }
+        )
+
+    @action(detail=False, methods=["get"])
+    def dashboard_analitico(self, request):
+        """
+        📊 NOVO: Retorna dados estruturados para alimentar os gráficos do Vue (Pizza, Barras e Alertas).
+        """
+        # 1. Gráfico de Pizza: Distribuição de Risco Computada pela IA
+        distribuicao_risco = (
+            Student.objects.values("ia_risk_level")
+            .annotate(total=Count("id"))
+            .order_by("-total")
+        )
+
+        # 2. Gráfico de Barras: Média de Notas por Disciplina Técnica
+        # Como final_average é CharField ("7,1"), convertemos dinamicamente para Float para calcular a média real
+        notas_convertidas = ComponentGradeDetail.objects.annotate(
+            nota_float=Cast(
+                models.functions.Replace(
+                    F("final_average"), models.Value(","), models.Value(".")
+                ),
+                output_field=models.FloatField(),
+            )
+        )
+
+        medias_por_disciplina = (
+            notas_convertidas.values(nome_materia=F("subject__name"))
+            .annotate(media_geral=Avg("nota_float"))
+            .order_by("-media_geral")
+        )
+
+        # 3. Alerta de Evasão Escolar: Top 5 alunos com mais faltas acumuladas
+        alertas_evasao = (
+            Student.objects.all()
+            .order_by("-total_absences")[:5]
+            .values("id", "name", "total_absences", "frequency_pct_annual", "status")
+        )
 
         return Response(
             {
-                "total_alunos": total,
-                "alunos_em_risco": em_risco,
-                "alunos_retidos_faltas": retidos_faltas,
+                "grafico_pizza_risco": distribuicao_risco,
+                "grafico_barras_materias": medias_por_disciplina,
+                "alerta_evasao_top5": alertas_evasao,
             }
         )
 
@@ -55,7 +112,8 @@ class StudentViewSet(
             with open(caminho_arquivo, mode="r", encoding="utf-8-sig") as file:
                 linhas = list(csv.reader(file))
 
-            cabecalho = lines = linhas[9]
+            # Corrigido atribuição duplicada redundante (cabecalho = lines = linhas[9])
+            cabecalho = linhas[9]
 
             disciplinas_foco = {
                 "CARREIRA E COMPETENCIAS PARA O MERCADO DE TRABALHO": {
@@ -65,7 +123,7 @@ class StudentViewSet(
                 "LOGICA E LINGUAGENS DE PROGRAMACAO": {
                     "slug": "lógica",
                     "code": "9938",
-                },  # 💡 Padronizado minúsculo igual ao seu banco
+                },
                 "PROCESSOS DE DESENVOLVIMENTO DE SOFTWARE E METODOLOGIAS AGEIS": {
                     "slug": "Ágeis",
                     "code": "51003",
@@ -113,41 +171,53 @@ class StudentViewSet(
                 qtd_notas = 0
 
                 for subject_obj, idx_nota in indices_materias.items():
+                    if idx_nota >= len(linha):
+                        continue
+
                     nota_bruta = linha[idx_nota].strip()
 
                     try:
                         nota_final = float(nota_bruta.replace(",", "."))
                         nota_str = str(nota_final).replace(".", ",")
-                    except ValueError:
-                        nota_str = None  # Deixa nulo se não houver nota no CSV, para o professor editar no Vue
-
-                    if nota_str:
-                        soma_notas += float(nota_str.replace(",", "."))
+                        soma_notas += nota_final
                         qtd_notas += 1
+                    except ValueError:
+                        nota_str = None  # Deixa nulo se não houver nota no CSV (ex: Lógica sem nota)
 
                     obs = ""
                     if nota_str and float(nota_str.replace(",", ".")) < 5.0:
                         obs = "recuperação"
 
-                    # Grava ou atualiza a nota
                     ComponentGradeDetail.objects.update_or_create(
                         student=aluno_obj,
                         subject=subject_obj,
                         defaults={"final_average": nota_str, "observation": obs},
                     )
 
+                # 🤖 Recalcula o nível de risco de IA dinamicamente se o aluno estiver sem notas ou abaixo da média
+                if qtd_notas > 0:
+                    media_geral = soma_notas / qtd_notas
+                    if media_geral < 5.0:
+                        aluno_obj.ia_risk_level = "CRÍTICO"
+                        aluno_obj.ia_diagnostic_report = f"Atenção: Aluno com média técnica insuficiente ({media_geral:.1f}). Necessita de rebatimento."
+                        aluno_obj.save()
+
                 alunos_processados += 1
 
             return Response(
                 {
                     "status": "sucesso",
-                    "mensagem": f"{alunos_processados} alunos sincronizados!",
+                    "mensagem": f"{alunos_processados} alunos sincronizados com sucesso!",
                 }
             )
 
         except Exception as e:
             return Response(
-                {"error": "Erro no processamento", "details": str(e)}, status=500
+                {
+                    "error": "Erro no processamento interno do arquivo",
+                    "details": str(e),
+                },
+                status=500,
             )
 
 
@@ -157,7 +227,6 @@ class ComponentGradeDetailViewSet(viewsets.ModelViewSet):
     """
 
     queryset = ComponentGradeDetail.objects.all()
-    # Se você já tiver um serializer para as notas, use-o aqui. Caso contrário, garanta que ele exista.
     from .serializers import ComponentGradeDetailSerializer
 
     serializer_class = ComponentGradeDetailSerializer

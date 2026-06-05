@@ -18,12 +18,18 @@ Including another URLconf
 from django.contrib import admin
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from dashboard.views import StudentViewSet
+from dashboard.views import (
+    StudentViewSet,
+    ComponentGradeDetailViewSet,
+)  # <-- Importe a nova ViewSet
 
 router = DefaultRouter()
 router.register(r"students", StudentViewSet, basename="student")
+router.register(
+    r"grades", ComponentGradeDetailViewSet, basename="grade"
+)  # <-- 🔓 Nova rota registrada!
 
 urlpatterns = [
     path("admin/", admin.site.urls),
-    path("api/", include(router.urls)),  # <--- Vincula as APIs na rota /api/students/
+    path("api/", include(router.urls)),
 ]

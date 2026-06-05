@@ -123,3 +123,9 @@ class StudentDashboardSerializer(serializers.ModelSerializer):
             return f"Diagnóstico de Alerta Estrutural: Aluno apresenta dificuldades severas e concomitantes em {len(rec_subjects)} disciplinas técnicas ({materias_lista}). Requer plano integrado de apoio pedagógico e convocação de responsáveis para alinhamento estratégico."
         else:
             return f"Acompanhamento focado sugerido: Aluno demonstra bom engajamento geral ({freq_str}), porém necessita de reforço pontual nos seguintes componentes: {materias_lista}."
+
+
+class ComponentGradeDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ComponentGradeDetail
+        fields = "__all__"  # Libera todos os campos para edição (activities, assignments, tests, final_average, etc.)

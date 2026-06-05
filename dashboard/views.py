@@ -2,9 +2,6 @@ import csv
 import glob
 import os
 import re
-from django.db.models import Count, Avg, F
-from django.db.models.functions import Cast
-from django.db import models
 from rest_framework import viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -21,7 +18,7 @@ class StudentViewSet(viewsets.ModelViewSet):
     Endpoint completo (CRUD) para gerenciar alunos e gerar inteligência analítica para o Dashboard.
     """
 
-    # 🏎️ Otimização N+1: Traz tudo em 2 queries com JOIN na memória
+    # Otimização N+1 para carregar tudo de forma super rápida em memória
     queryset = (
         Student.objects.all()
         .prefetch_related("component_grades__subject")
@@ -31,53 +28,84 @@ class StudentViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"])
     def resumo_conselho(self, request):
-        """Gera métricas rápidas para os cartões superiores do painel usando agregação nativa."""
-        # Agregação unificada para evitar 3 COUNTs separados no banco
-        metricas = Student.objects.aggregate(
-            total=Count("id"),
-            em_risco=Count(
-                "id",
-                filter=models.Q(status__icontains="recuperação")
-                | models.Q(ia_risk_level__in=["CRÍTICO", "ALTO"]),
-            ),
-            retidos=Count("id", filter=models.Q(status__icontains="retido")),
+        """Gera métricas rápidas para os cartões superiores do painel baseando-se nos dados reais."""
+        total = Student.objects.count()
+        # Conta alunos que possuem qualquer disciplina em situação de recuperação
+        em_risco = (
+            Student.objects.filter(
+                component_grades__observation__icontains="recuperação"
+            )
+            .distinct()
+            .count()
         )
+        retidos = Student.objects.filter(status__icontains="retido").count()
+
         return Response(
             {
-                "total_alunos": metricas["total"],
-                "alunos_em_risco": metricas["em_risco"],
-                "alunos_retidos_faltas": metricas["retidos"],
+                "total_alunos": total,
+                "alunos_em_risco": em_risco,
+                "alunos_retidos_faltas": retidos,
             }
         )
 
     @action(detail=False, methods=["get"])
     def dashboard_analitico(self, request):
         """
-        📊 NOVO: Retorna dados estruturados para alimentar os gráficos do Vue (Pizza, Barras e Alertas).
+        📊 Retorna dados estruturados e limpos para alimentar os gráficos do Vue (Pizza, Barras e Alertas).
+        Calculado via Python para total segurança de tipos no PostgreSQL.
         """
-        # 1. Gráfico de Pizza: Distribuição de Risco Computada pela IA
-        distribuicao_risco = (
-            Student.objects.values("ia_risk_level")
-            .annotate(total=Count("id"))
-            .order_by("-total")
-        )
+        # 1. Gráfico de Pizza: Classificação Dinâmica de Risco por Frequência e Faltas
+        alunos = Student.objects.all()
+        baixo_risco = 0
+        medio_risco = 0
+        alto_risco = 0
 
-        # 2. Gráfico de Barras: Média de Notas por Disciplina Técnica
-        # Como final_average é CharField ("7,1"), convertemos dinamicamente para Float para calcular a média real
-        notas_convertidas = ComponentGradeDetail.objects.annotate(
-            nota_float=Cast(
-                models.functions.Replace(
-                    F("final_average"), models.Value(","), models.Value(".")
-                ),
-                output_field=models.FloatField(),
+        for aluno in alunos:
+            try:
+                freq_str = aluno.frequency_pct_annual or "100%"
+                freq_val = float(freq_str.replace("%", "").strip().replace(",", "."))
+            except ValueError:
+                freq_val = 100.0
+
+            # Regra de negócio: Frequência abaixo de 75% ou muitas faltas = Risco Alto
+            if freq_val < 75.0 or aluno.total_absences > 20:
+                alto_risco += 1
+            elif freq_val < 85.0 or aluno.total_absences > 10:
+                medio_risco += 1
+            else:
+                baixo_risco += 1
+
+        grafico_pizza_risco = [
+            {"ia_risk_level": "BAIXO", "total": baixo_risco},
+            {"ia_risk_level": "MÉDIO", "total": medio_risco},
+            {"ia_risk_level": "ALTO", "total": alto_risco},
+        ]
+
+        # 2. Gráfico de Barras: Média Real de Notas por Disciplina Técnica
+        grades = ComponentGradeDetail.objects.select_related("subject").all()
+        materia_dados = {}
+
+        for g in grades:
+            nome_materia = g.subject.name
+            if not g.final_average:
+                continue
+            try:
+                nota = float(g.final_average.replace(",", "."))
+                if nome_materia not in materia_dados:
+                    materia_dados[nome_materia] = []
+                materia_dados[nome_materia].append(nota)
+            except ValueError:
+                continue
+
+        grafico_barras_materias = []
+        for nome_materia, lista_notas in materia_dados.items():
+            media = sum(lista_notas) / len(lista_notas) if lista_notas else 0
+            grafico_barras_materias.append(
+                {"nome_materia": nome_materia, "media_geral": round(media, 2)}
             )
-        )
 
-        medias_por_disciplina = (
-            notas_convertidas.values(nome_materia=F("subject__name"))
-            .annotate(media_geral=Avg("nota_float"))
-            .order_by("-media_geral")
-        )
+        # Ordena as matérias da maior média para a menor
+        grafico_barras_materias.sort(key=lambda x: x["media_geral"], reverse=True)
 
         # 3. Alerta de Evasão Escolar: Top 5 alunos com mais faltas acumuladas
         alertas_evasao = (
@@ -88,15 +116,15 @@ class StudentViewSet(viewsets.ModelViewSet):
 
         return Response(
             {
-                "grafico_pizza_risco": distribuicao_risco,
-                "grafico_barras_materias": medias_por_disciplina,
-                "alerta_evasao_top5": alertas_evasao,
+                "grafico_pizza_risco": grafico_pizza_risco,
+                "grafico_barras_materias": grafico_barras_materias,
+                "alerta_evasao_top5": list(alertas_evasao),
             }
         )
 
     @action(detail=False, methods=["post"])
     def importar_mapao(self, request):
-        """Lê o arquivo CSV do Conselho dentro da pasta csv_data e atualiza o Banco."""
+        """Lê o arquivo CSV do Conselho dentro da pasta csv_data e atualiza o Banco de dados."""
         base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         pasta_csv = os.path.join(base_dir, "csv_data")
         arquivos_csv = glob.glob(os.path.join(pasta_csv, "*.csv"))
@@ -112,7 +140,6 @@ class StudentViewSet(viewsets.ModelViewSet):
             with open(caminho_arquivo, mode="r", encoding="utf-8-sig") as file:
                 linhas = list(csv.reader(file))
 
-            # Corrigido atribuição duplicada redundante (cabecalho = lines = linhas[9])
             cabecalho = linhas[9]
 
             disciplinas_foco = {
@@ -145,7 +172,7 @@ class StudentViewSet(viewsets.ModelViewSet):
 
             alunos_processados = 0
 
-            for linha in linhas[11:]:
+            for linha in lines_row in linhas[11:]:
                 if not linha or len(linha) < 2:
                     continue
 
@@ -167,9 +194,6 @@ class StudentViewSet(viewsets.ModelViewSet):
                     },
                 )
 
-                soma_notas = 0
-                qtd_notas = 0
-
                 for subject_obj, idx_nota in indices_materias.items():
                     if idx_nota >= len(linha):
                         continue
@@ -179,10 +203,8 @@ class StudentViewSet(viewsets.ModelViewSet):
                     try:
                         nota_final = float(nota_bruta.replace(",", "."))
                         nota_str = str(nota_final).replace(".", ",")
-                        soma_notas += nota_final
-                        qtd_notas += 1
                     except ValueError:
-                        nota_str = None  # Deixa nulo se não houver nota no CSV (ex: Lógica sem nota)
+                        nota_str = None  # Salva nulo perfeitamente se a matéria não tiver nota lançada
 
                     obs = ""
                     if nota_str and float(nota_str.replace(",", ".")) < 5.0:
@@ -193,14 +215,6 @@ class StudentViewSet(viewsets.ModelViewSet):
                         subject=subject_obj,
                         defaults={"final_average": nota_str, "observation": obs},
                     )
-
-                # 🤖 Recalcula o nível de risco de IA dinamicamente se o aluno estiver sem notas ou abaixo da média
-                if qtd_notas > 0:
-                    media_geral = soma_notas / qtd_notas
-                    if media_geral < 5.0:
-                        aluno_obj.ia_risk_level = "CRÍTICO"
-                        aluno_obj.ia_diagnostic_report = f"Atenção: Aluno com média técnica insuficiente ({media_geral:.1f}). Necessita de rebatimento."
-                        aluno_obj.save()
 
                 alunos_processados += 1
 
@@ -223,7 +237,7 @@ class StudentViewSet(viewsets.ModelViewSet):
 
 class ComponentGradeDetailViewSet(viewsets.ModelViewSet):
     """
-    Endpoint 🔓 COMPLETO (CRUD) para gerenciar as notas diretamente (Editar, Atualizar, Deletar)
+    Endpoint COMPLETO (CRUD) para gerenciar as notas diretamente (Editar, Atualizar, Deletar)
     """
 
     queryset = ComponentGradeDetail.objects.all()

@@ -118,7 +118,17 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
-STATIC_URL = "static/"
+# Configuração de Arquivos Estáticos (CSS, JavaScript, Imagens)
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+
+# Habilita o armazenamento otimizado e compactado do WhiteNoise
+STORAGES = {
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
+    },
+}
+
 CORS_ALLOW_ALL_ORIGINS = True  # Para facilitar a comunicação com o dashboard
 
 # Confiança de origem para o sistema de segurança CSRF do Django 5/6

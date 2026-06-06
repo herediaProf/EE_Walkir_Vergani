@@ -51,10 +51,10 @@ class StudentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["get"])
     def dashboard_analitico(self, request):
         """
-        📊 Retorna dados estruturados e limpos para alimentar os gráficos do Vue (Pizza, Barras e Alertas).
-        Calculado via Python para total segurança de tipos no PostgreSQL.
+        📊 Retorna dados estruturados e limpos para alimentar os gráficos do Vue.
+        Melhoria: Ordenação de evasão por menor frequência e segurança extra.
         """
-        # 1. Gráfico de Pizza: Classificação Dinâmica de Risco por Frequência e Faltas
+        # 1. Gráfico de Pizza: Classificação Dinâmica de Risco
         alunos = Student.objects.all()
         baixo_risco = 0
         medio_risco = 0
@@ -67,7 +67,6 @@ class StudentViewSet(viewsets.ModelViewSet):
             except ValueError:
                 freq_val = 100.0
 
-            # Regra de negócio: Frequência abaixo de 75% ou muitas faltas = Risco Alto
             if freq_val < 75.0 or aluno.total_absences > 20:
                 alto_risco += 1
             elif freq_val < 85.0 or aluno.total_absences > 10:
@@ -104,21 +103,43 @@ class StudentViewSet(viewsets.ModelViewSet):
                 {"nome_materia": nome_materia, "media_geral": round(media, 2)}
             )
 
-        # Ordena as matérias da maior média para a menor
         grafico_barras_materias.sort(key=lambda x: x["media_geral"], reverse=True)
 
-        # 3. Alerta de Evasão Escolar: Top 5 alunos com mais faltas acumuladas
-        alertas_evasao = (
-            Student.objects.all()
-            .order_by("-total_absences")[:5]
-            .values("id", "name", "total_absences", "frequency_pct_annual", "status")
-        )
+        # 3. 🔥 EVASÃO APERFEIÇOADA: Filtra alunos ativos e ordena por MENOR frequência anual
+        todos_ativos = Student.objects.filter(status="Ativo")
+
+        # Como frequency_pct_annual é CharField ("94%"), ordenamos convertendo temporariamente em Python
+        def obter_freq_numerica(aluno_obj):
+            try:
+                return float(
+                    aluno_obj.frequency_pct_annual.replace("%", "")
+                    .strip()
+                    .replace(",", ".")
+                )
+            except (ValueError, AttributeError):
+                return 100.0
+
+        # Ordena do que tem MENOR frequência para o que tem MAIOR frequência
+        alunos_ordenados_por_risco = sorted(todos_ativos, key=obter_freq_numerica)
+        top5_evasao = alunos_ordenados_por_risco[:5]
+
+        alerta_evasao_top5 = []
+        for a in top5_evasao:
+            alerta_evasao_top5.append(
+                {
+                    "id": a.id,
+                    "name": a.name,
+                    "total_absences": a.total_absences,
+                    "frequency_pct_annual": a.frequency_pct_annual,
+                    "status": a.status,
+                }
+            )
 
         return Response(
             {
                 "grafico_pizza_risco": grafico_pizza_risco,
                 "grafico_barras_materias": grafico_barras_materias,
-                "alerta_evasao_top5": list(alertas_evasao),
+                "alerta_evasao_top5": alerta_evasao_top5,
             }
         )
 
